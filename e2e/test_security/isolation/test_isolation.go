@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/loft-sh/e2e-framework/pkg/setup/cluster"
 	"github.com/loft-sh/vcluster/e2e/constants"
 	"github.com/loft-sh/vcluster/e2e/labels"
+	"github.com/loft-sh/vcluster/pkg/util/podhelper"
 	"github.com/loft-sh/vcluster/pkg/util/random"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -154,6 +156,92 @@ func IsolationModeSpec() {
 						g.Expect(found).To(BeTrue(),
 							"expected LimitRange violation event for pod %s (cpu request 2 exceeds limit), events: %v", podName, events.Items)
 					}).WithPolling(constants.PollingInterval).WithTimeout(constants.PollingTimeout).Should(Succeed())
+				})
+			})
+
+			It("prevents pods in the vCluster from reaching pods outside the vCluster", func(ctx context.Context) {
+				vClusterConfig := cluster.From(ctx, vClusterName).KubernetesRestConfig()
+				Expect(vClusterConfig).NotTo(BeNil())
+				suffix := random.String(6)
+				outsideNS := "outside-" + suffix
+				outsidePod := "outside-pod-" + suffix
+				insidePod := "inside-pod-" + suffix
+
+				// Create a namespace + pod on the host that is *not* part of the vCluster
+				_, err := hostClient.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{Name: outsideNS},
+				}, metav1.CreateOptions{})
+				Expect(err).To(Succeed())
+				DeferCleanup(func(ctx context.Context) {
+					_ = hostClient.CoreV1().Namespaces().Delete(ctx, outsideNS, metav1.DeleteOptions{})
+				})
+
+				_, err = hostClient.CoreV1().Pods(outsideNS).Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   outsidePod,
+						Labels: map[string]string{"app": outsidePod},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "nginx",
+							Image: "busybox",
+							Ports: []corev1.ContainerPort{{ContainerPort: 80}},
+						}},
+					},
+				}, metav1.CreateOptions{})
+				Expect(err).To(Succeed())
+
+				// Wait for the outside pod to be ready
+				Eventually(func(g Gomega) {
+					p, err := hostClient.CoreV1().Pods(outsideNS).Get(ctx, outsidePod, metav1.GetOptions{})
+					g.Expect(err).To(Succeed())
+					g.Expect(p.Status.Phase).To(Equal(corev1.PodRunning))
+				}).WithPolling(constants.PollingInterval).WithTimeout(constants.PollingTimeout).Should(Succeed())
+
+				outsideIP := ""
+				Eventually(func(g Gomega) {
+					p, err := hostClient.CoreV1().Pods(outsideNS).Get(ctx, outsidePod, metav1.GetOptions{})
+					g.Expect(err).To(Succeed())
+					g.Expect(p.Status.PodIP).NotTo(BeEmpty())
+					outsideIP = p.Status.PodIP
+				}).WithPolling(constants.PollingInterval).WithTimeout(constants.PollingTimeout).Should(Succeed())
+
+				// Create a pod inside the vCluster that tries to reach the outside pod
+				_, err = vClusterClient.CoreV1().Pods("default").Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: insidePod},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:    "curl",
+							Image:   "curlimages/curl:8.10.1",
+							Command: []string{"sleep", "3600"},
+						}},
+					},
+				}, metav1.CreateOptions{})
+				Expect(err).To(Succeed())
+				DeferCleanup(func(ctx context.Context) {
+					_ = vClusterClient.CoreV1().Pods("default").Delete(ctx, insidePod, metav1.DeleteOptions{})
+				})
+
+				Eventually(func(g Gomega) {
+					p, err := vClusterClient.CoreV1().Pods("default").Get(ctx, insidePod, metav1.GetOptions{})
+					g.Expect(err).To(Succeed())
+					g.Expect(p.Status.Phase).To(Equal(corev1.PodRunning))
+				}).WithPolling(constants.PollingInterval).WithTimeout(constants.PollingTimeoutLong).Should(Succeed())
+				
+				By("verifying the inside pod cannot reach the outside pod", func() {
+					Consistently(func(g Gomega) {
+					execCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+
+					cmd := []string{"curl", "-s", "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}", "http://" + outsideIP}
+					stdout, stderr, err := podhelper.ExecBuffered(execCtx, vClusterConfig, "default", insidePod, "curl", cmd, nil)
+
+					// We expect the call to fail or not return 200
+					output := string(stdout)
+					g.Expect(err != nil || output != "200").To(BeTrue(),
+						"expected curl to outside pod to fail or not return 200, got stdout=%q stderr=%q err=%v",
+						output, string(stderr), err)
+					}).WithPolling(constants.PollingInterval).WithTimeout(constants.PollingTimeoutShort).Should(Succeed())
 				})
 			})
 		},
